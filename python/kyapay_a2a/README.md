@@ -354,28 +354,37 @@ Adding it is additive and non-breaking — the default flow is unchanged.
 ```python
 from kyapay_a2a.rails import NanoRail, create_nano_payment_requirement
 
-# Merchant publishes a Nano payment requirement (parallel to a Skyfire token):
+# Merchant publishes a Nano payment requirement (parallel to a Skyfire token).
+# The requirement binds the advertised USD price to an exact raw amount.
 requirement = create_nano_payment_requirement(
     price_usd="1.00",
     resource="/api/service",
     nano_address="nano_1qjz76gqzwq9segqad9an3xtdkx5qxj99xft68yfrtxxsayq3fn3miqhow3n",
+    xno_usd=1.0,
 )
 
-# Quote and settle on the Nano rail:
-rail = NanoRail()
-quote = rail.quote(1.00)          # fee $0.00, finality 0.3s
-result = rail.pay(
+# Quote, then settle by verifying the buyer's block on the Nano ledger.
+rail = NanoRail(rpc=my_rpc, xno_usd=1.0)
+quote = rail.quote(1.00)                    # fee $0.00, finality 0.3s
+result = rail.verify(
+    "buyer_block_hash",                     # the hash a buyer supplies
     destination=requirement["nano_address"],
-    amount_raw="1000000000000000000000000",
+    amount_raw=requirement["amount_raw"],   # exactly the advertised price
 )
-print(result.settled, result.block_hash)   # True <block hash>
+print(result.settled, result.block_hash)    # True <block hash>
 ```
 
-Quote (`fee_usd=0`, `finality_s=0.3`) and payment go through a pluggable `rpc`
-seam, so the example and tests run with **no wallet and no keys** — the shipped
-stub never touches the live network. To go live, point `rpc` at a real Nano RPC
-(e.g. `rpc.nano.to`) or wrap an existing Nano x402 client (e.g. `x402nano-exact`
-/ `feeless402`), which this rail reuses rather than rebuilding.
+Settlement is a **merchant-side verification, not a signer**: the buyer signs
+and broadcasts the send block; a merchant asks its `rpc` for that block's
+`block_info` and only reports `settled=True` when the destination and raw
+amount match the advertised requirement. This **fails closed** — an unconfigured
+rail or an unmatched block is never reported as paid. Quote (`fee_usd=0`,
+`finality_s=0.3`) and the confirmation read go through a pluggable `rpc` seam,
+so the example and tests run with **no wallet and no keys** — the shipped stub
+confirms nothing, and the example supplies a stub that confirms only the exact
+amount. To go live, point `rpc` at a real Nano RPC (e.g. `rpc.nano.to`) or wrap
+an existing Nano x402 client (e.g. `x402nano-exact` / `feeless402`), which this
+rail reuses rather than rebuilding.
 
 Run the two-rail comparison:
 

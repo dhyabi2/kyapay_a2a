@@ -21,12 +21,16 @@ from .nano import (
     NanoPaymentResult,
     NanoQuote,
     NanoRail,
+    PaymentNotConfirmed,
     create_nano_payment_requirement,
+    usd_to_raw,
 )
 
 __all__ = [
     "NanoPaymentResult",
     "NanoQuote",
     "NanoRail",
+    "PaymentNotConfirmed",
     "create_nano_payment_requirement",
+    "usd_to_raw",
 ]
