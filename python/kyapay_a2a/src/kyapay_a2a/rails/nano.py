@@ -32,7 +32,8 @@ ambiguous is reported as not settled rather than assumed paid.
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal, localcontext
+from threading import Lock
 from typing import Any
 
 # Nano has 10^30 raw per whole XNO.
@@ -56,7 +57,11 @@ def usd_to_raw(price_usd: str | float, xno_usd: str | float) -> str:
     rate = Decimal(str(xno_usd))
     if rate <= 0:
         raise ValueError("xno_usd must be positive")
-    raw = (price / rate * Decimal(RAWS_PER_XNO)).to_integral_value()
+    # Default Decimal precision (28 digits) is too small for 30-decimal raw
+    # amounts; multiply before dividing, at a precision that keeps every digit.
+    with localcontext() as ctx:
+        ctx.prec = 80
+        raw = (price * RAWS_PER_XNO / rate).to_integral_value(rounding=ROUND_DOWN)
     return str(int(raw))
 
 
@@ -98,11 +103,23 @@ class NanoRail:
     ``rpc`` is any callable that accepts an RPC request dict and returns the
     JSON-RPC response dict. A real integration passes rpc.nano.to (or wraps an
     existing Nano x402 client such as ``x402nano-exact`` / ``feeless402``).
+
+    A Nano block is immutable, so one block hash could otherwise authorize
+    repeated deliveries. ``verify`` therefore *consumes* the hash: ``claim`` is
+    called once per successful verification and must return ``True`` only the
+    first time a hash is claimed (atomically). The default is an in-process set
+    guarded by a lock; a multi-process merchant must pass a claim backed by
+    shared storage (e.g. a unique-key insert).
     """
 
     name = "nano-xno"
 
-    def __init__(self, rpc: Callable[..., Any] | None = None, xno_usd: float = 1.0) -> None:
+    def __init__(
+        self,
+        rpc: Callable[..., Any] | None = None,
+        xno_usd: str | float = "1.0",
+        claim: Callable[[str], bool] | None = None,
+    ) -> None:
         """Build a Nano rail.
 
         Args:
@@ -110,11 +127,38 @@ class NanoRail:
                 omitted the rail is built with a stub that reports *no*
                 confirmation, so an unconfigured rail never settles a payment
                 (fail-closed by default).
-            xno_usd: XNO/USD rate used to convert an advertised USD price to a
-                raw amount. Override in production with a live quote.
+            xno_usd: XNO/USD rate used by ``amount_raw_for`` and
+                ``requirement`` to convert an advertised USD price to a raw
+                amount. Override in production with a live quote.
+            claim: atomic "first use" check for a block hash (see class
+                docstring). Defaults to an in-process set.
         """
         self._rpc = rpc or self._stub_no_confirmation
-        self._xno_usd = float(xno_usd)
+        self._xno_usd = str(xno_usd)
+        self._claimed: set[str] = set()
+        self._claim_lock = Lock()
+        self._claim = claim or self._claim_in_process
+
+    def _claim_in_process(self, block_hash: str) -> bool:
+        with self._claim_lock:
+            if block_hash in self._claimed:
+                return False
+            self._claimed.add(block_hash)
+            return True
+
+    def amount_raw_for(self, price_usd: str | float) -> str:
+        """The raw amount this rail expects for ``price_usd`` at its rate."""
+        return usd_to_raw(price_usd, self._xno_usd)
+
+    def requirement(
+        self, price_usd: str, resource: str, nano_address: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Build a payment requirement with this rail's rate, so the advertised
+        amount and the amount ``verify`` is later called with share one
+        conversion path."""
+        return create_nano_payment_requirement(
+            price_usd, resource, nano_address, xno_usd=self._xno_usd, **kwargs
+        )
 
     @staticmethod
     def _stub_no_confirmation(request: dict[str, Any]) -> dict[str, Any]:
@@ -139,7 +183,11 @@ class NanoRail:
             }
         )
         if not isinstance(response, dict) or "error" in response:
-            raise PaymentNotConfirmed(f"block_info returned no confirmed block: {response!r}")
+            raise PaymentNotConfirmed(f"block_info returned no block: {response!r}")
+        # Nano RPC reports confirmation separately, usually as the string
+        # "true"/"false". Only an affirmative value counts.
+        if str(response.get("confirmed", "")).lower() != "true":
+            raise PaymentNotConfirmed("block is not confirmed on the ledger")
         return response
 
     def verify(
@@ -159,25 +207,46 @@ class NanoRail:
 
         Returns:
             A ``NanoPaymentResult`` with ``settled=True`` only when the ledger
-            shows a block whose ``destination`` and ``amount`` exactly match.
+            shows a confirmed send block whose destination and amount exactly
+            match, and the block hash has not been used before.
 
         Raises:
             PaymentNotConfirmed: when the block does not exist, is not
-            confirmed, or does not match the expected amount/destination.
+            confirmed, is not a send, does not match the expected
+            amount/destination, or was already consumed.
         """
         info = self._query_block(block_hash)
-        block = info.get("contents", {})
-        block_amount = block.get("amount", "0")
-        block_destination = block.get("link_as_account", "")
+        block = info.get("contents")
+        if not isinstance(block, dict):
+            raise PaymentNotConfirmed("block_info returned no block contents")
 
-        if block_amount != amount_raw:
+        # A state block says "send" in the top-level ``subtype``; a legacy
+        # send block says it in ``contents.type``.
+        is_send = info.get("subtype") == "send" or block.get("type") == "send"
+        if not is_send:
+            raise PaymentNotConfirmed("block is not a send")
+
+        # block_info reports the transferred amount at the top level;
+        # ``contents`` holds the serialized block (whose ``balance`` is the
+        # sender's remaining balance, not the amount sent).
+        block_amount = str(info.get("amount", ""))
+        if block_amount != str(amount_raw):
             raise PaymentNotConfirmed(
-                f"amount mismatch: expected {amount_raw}, found {block_amount}"
+                f"amount mismatch: expected {amount_raw}, found {block_amount or 'none'}"
             )
-        if block_destination and block_destination != destination:
+
+        # State blocks carry the recipient in link_as_account; legacy send
+        # blocks in destination. It must be present and exact.
+        block_destination = (
+            block.get("link_as_account") or block.get("destination") or ""
+        )
+        if block_destination != destination:
             raise PaymentNotConfirmed(
-                f"destination mismatch: expected {destination}, found {block_destination}"
+                f"destination mismatch: expected {destination}, found {block_destination or 'none'}"
             )
+
+        if not self._claim(block_hash):
+            raise PaymentNotConfirmed("block hash already used for a settled payment")
         return NanoPaymentResult(
             settled=True,
             rail=self.name,

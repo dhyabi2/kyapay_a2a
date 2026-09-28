@@ -352,19 +352,20 @@ feeless, sub-second, self-custodial alternative in addition to a Skyfire token.
 Adding it is additive and non-breaking — the default flow is unchanged.
 
 ```python
-from kyapay_a2a.rails import NanoRail, create_nano_payment_requirement
+from kyapay_a2a.rails import NanoRail
+
+# One rail, one XNO/USD rate (1.0 here is a placeholder: use a live quote).
+rail = NanoRail(rpc=my_rpc, xno_usd="1.0")
 
 # Merchant publishes a Nano payment requirement (parallel to a Skyfire token).
-# The requirement binds the advertised USD price to an exact raw amount.
-requirement = create_nano_payment_requirement(
+# The requirement binds the advertised USD price to an exact raw amount,
+# converted with the rail's own rate.
+requirement = rail.requirement(
     price_usd="1.00",
     resource="/api/service",
     nano_address="nano_1qjz76gqzwq9segqad9an3xtdkx5qxj99xft68yfrtxxsayq3fn3miqhow3n",
-    xno_usd=1.0,
 )
 
-# Quote, then settle by verifying the buyer's block on the Nano ledger.
-rail = NanoRail(rpc=my_rpc, xno_usd=1.0)
 quote = rail.quote(1.00)                    # fee $0.00, finality 0.3s
 result = rail.verify(
     "buyer_block_hash",                     # the hash a buyer supplies
@@ -376,8 +377,11 @@ print(result.settled, result.block_hash)    # True <block hash>
 
 Settlement is a **merchant-side verification, not a signer**: the buyer signs
 and broadcasts the send block; a merchant asks its `rpc` for that block's
-`block_info` and only reports `settled=True` when the destination and raw
-amount match the advertised requirement. This **fails closed** — an unconfigured
+`block_info` and only reports `settled=True` when the node marks the block
+`confirmed`, it is a send, its recipient and top-level `amount` match the
+advertised requirement exactly, and the block hash has not been used before
+(one block pays for one delivery; pass `claim=` to back that check with shared
+storage in a multi-process merchant). This **fails closed** — an unconfigured
 rail or an unmatched block is never reported as paid. Quote (`fee_usd=0`,
 `finality_s=0.3`) and the confirmation read go through a pluggable `rpc` seam,
 so the example and tests run with **no wallet and no keys** — the shipped stub

@@ -30,11 +30,13 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from kyapay_a2a.rails import NanoRail, create_nano_payment_requirement
+from kyapay_a2a.rails import NanoRail
 from kyapay_a2a.rails.nano import PaymentNotConfirmed
 
 PRICE_USD = "1.00"
-XNO_USD = 1.0
+# Placeholder XNO/USD rate so the example is deterministic. In production use a
+# live quote: the raw amount below is only "$1.00" at this rate.
+XNO_USD = "1.0"
 NANO_ADDRESS = "nano_1qjz76gqzwq9segqad9an3xtdkx5qxj99xft68yfrtxxsayq3fn3miqhow3n"
 # The exact raw amount for $1.00 at XNO=$1.00 — must match usd_to_raw.
 AMOUNT_RAW = str(10**30)
@@ -47,13 +49,15 @@ def _confirming_rpc(request):
     same ``verify`` read confirms the buyer's actual block from the ledger.
     """
     if request.get("action") == "block_info":
+        # Shape of a real block_info reply for a state send block.
         return {
+            "amount": AMOUNT_RAW,
+            "confirmed": "true",
+            "subtype": "send",
             "contents": {
-                "type": "send",
-                "amount": AMOUNT_RAW,
+                "type": "state",
                 "link_as_account": NANO_ADDRESS,
             },
-            "confirmed": True,
         }
     return {"error": "unknown action"}
 
@@ -72,11 +76,10 @@ def main() -> None:
     print("  finality : 2.0s")
 
     # Rail 2 — peer-to-peer Nano (XNO).
-    nano_req = create_nano_payment_requirement(
+    nano_req = rail.requirement(
         price_usd=PRICE_USD,
         resource="/api/service",
         nano_address=NANO_ADDRESS,
-        xno_usd=XNO_USD,
         description="Payment required (Nano XNO rail)",
     )
     quote = rail.quote(1.00)
