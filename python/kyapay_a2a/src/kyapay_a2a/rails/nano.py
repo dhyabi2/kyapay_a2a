@@ -40,9 +40,13 @@ from typing import Any
 # Nano has 10^30 raw per whole XNO.
 RAWS_PER_XNO = 10**30
 
-# Each requirement adds a random tag below this many raw to its amount, so a
-# block paid for one requirement cannot match another (10^6 raw is 10^-24 XNO).
+# Each requirement adds a random tag below this many raw to its amount
+# (10^6 raw is 10^-24 XNO). ``NanoRail.requirement`` re-draws a tag whose
+# amount is already outstanding for the same destination.
 AMOUNT_TAG_SPAN = 10**6
+
+# How many tags ``NanoRail.requirement`` draws before giving up.
+_TAG_ATTEMPTS = 64
 
 
 def usd_to_raw(price_usd: str | float, xno_usd: str | float) -> str:
@@ -160,6 +164,10 @@ class NanoRail:
         self._claimed: set[str] = set()
         self._claim_lock = Lock()
         self._claim = claim or self._claim_in_process
+        # (destination, amount_raw) -> (requirement_id, deadline or None) for
+        # requirements built by this rail and not yet settled or expired.
+        self._outstanding: dict[tuple[str, str], tuple[str, datetime | None]] = {}
+        self._outstanding_lock = Lock()
 
     def _claim_in_process(self, block_hash: str) -> bool:
         with self._claim_lock:
@@ -177,10 +185,47 @@ class NanoRail:
     ) -> dict[str, Any]:
         """Build a payment requirement with this rail's rate, so the advertised
         amount and the amount ``verify`` is later called with share one
-        conversion path."""
-        return create_nano_payment_requirement(
-            price_usd, resource, nano_address, xno_usd=self._xno_usd, **kwargs
-        )
+        conversion path.
+
+        The rail tracks the tagged amounts of its outstanding requirements per
+        destination and re-draws the tag on a collision, so no two outstanding
+        requirements from this rail share an amount and destination. An amount
+        is released when its requirement settles or expires; a requirement
+        without ``expires_in_seconds`` holds its amount until it settles. The
+        tracking is in-process: separate rail instances (or processes) paying
+        to one address do not see each other's amounts.
+
+        Raises:
+            ValueError: as ``create_nano_payment_requirement``, or when no
+                free amount was found for this price and destination.
+        """
+        with self._outstanding_lock:
+            now = datetime.now(timezone.utc)
+            for key, (_, deadline) in list(self._outstanding.items()):
+                if deadline is not None and now >= deadline:
+                    del self._outstanding[key]
+            for _ in range(_TAG_ATTEMPTS):
+                req = create_nano_payment_requirement(
+                    price_usd, resource, nano_address, xno_usd=self._xno_usd, **kwargs
+                )
+                key = (str(req["nano_address"]), str(req["amount_raw"]))
+                if key not in self._outstanding:
+                    deadline = (
+                        datetime.fromisoformat(req["expires_at"])
+                        if req["expires_at"]
+                        else None
+                    )
+                    self._outstanding[key] = (req["requirement_id"], deadline)
+                    return req
+        raise ValueError("no free amount for this price and destination")
+
+    def _release(self, destination: str, amount_raw: str, requirement_id: str) -> None:
+        """Free a settled requirement's amount for reuse."""
+        with self._outstanding_lock:
+            key = (destination, amount_raw)
+            entry = self._outstanding.get(key)
+            if entry is not None and entry[0] == requirement_id:
+                del self._outstanding[key]
 
     @staticmethod
     def _stub_no_confirmation(request: dict[str, Any]) -> dict[str, Any]:
@@ -233,10 +278,20 @@ class NanoRail:
             match, and the block hash has not been used before.
 
         Raises:
-            PaymentNotConfirmed: when the block does not exist, is not
+            PaymentNotConfirmed: when an argument is empty or ``amount_raw``
+            is not a positive integer, or the block does not exist, is not
             confirmed, is not a send, does not match the expected
             amount/destination, or was already consumed.
         """
+        if not isinstance(block_hash, str) or not block_hash:
+            raise PaymentNotConfirmed("no block hash to verify")
+        if not isinstance(destination, str) or not destination:
+            raise PaymentNotConfirmed("no destination to verify against")
+        amount_raw = "" if amount_raw is None else str(amount_raw)
+        if not (amount_raw.isascii() and amount_raw.isdigit()) or int(amount_raw) <= 0:
+            raise PaymentNotConfirmed(
+                f"expected amount is not a positive raw integer: {amount_raw!r}"
+            )
         info = self._query_block(block_hash)
         block = info.get("contents")
         if not isinstance(block, dict):
@@ -323,6 +378,7 @@ class NanoRail:
         )
         if not self._claim(f"requirement:{requirement_id}"):
             raise PaymentNotConfirmed("payment requirement was already settled")
+        self._release(str(destination), str(amount_raw), str(requirement_id))
         return result
 
     # Pay is intentionally not a signing operation on the merchant side. The
@@ -388,8 +444,9 @@ def create_nano_payment_requirement(
         A dict describing the Nano payment requirement: a random
         ``requirement_id`` and the exact raw amount the rail will accept
         (``amount_raw``), which is ``usd_to_raw(price_usd)`` plus a random tag
-        of 1 to ``AMOUNT_TAG_SPAN - 1`` raw. The tag makes the amount unique to
-        this requirement, so a block paid for it settles nothing else.
+        of 1 to ``AMOUNT_TAG_SPAN - 1`` raw. A bare call does not check for
+        collisions with other requirements; ``NanoRail.requirement`` does, so
+        that a block paid for one outstanding requirement matches no other.
 
     Raises:
         ValueError: for a non-positive or sub-raw price, or a non-positive

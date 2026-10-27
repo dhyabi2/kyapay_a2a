@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from kyapay_a2a.rails import nano
 from kyapay_a2a.rails.nano import (
     AMOUNT_TAG_SPAN,
     NanoPaymentResult,
@@ -182,6 +183,35 @@ def test_failed_verification_does_not_consume_the_hash():
     assert rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT).settled
 
 
+@pytest.mark.parametrize(
+    "block_hash, destination, amount_raw",
+    [
+        ("", DEST, AMOUNT),
+        (None, DEST, AMOUNT),
+        ("deadbeef", "", AMOUNT),
+        ("deadbeef", None, AMOUNT),
+        ("deadbeef", DEST, ""),
+        ("deadbeef", DEST, None),
+        ("deadbeef", DEST, "0"),
+        ("deadbeef", DEST, "-1"),
+        ("deadbeef", DEST, "1.5"),
+        ("", "", ""),
+    ],
+)
+def test_verify_rejects_empty_or_missing_inputs(block_hash, destination, amount_raw):
+    """Empty inputs fail closed even if the rpc reply is just as empty."""
+    calls = []
+
+    def empty_rpc(request):
+        calls.append(request)
+        return {"confirmed": "true", "subtype": "send", "contents": {}}
+
+    rail = NanoRail(rpc=empty_rpc)
+    with pytest.raises(PaymentNotConfirmed):
+        rail.verify(block_hash, destination=destination, amount_raw=amount_raw)
+    assert calls == []
+
+
 def test_pay_requires_a_block_hash():
     """pay() with no buyer block hash fails closed rather than settle."""
     rail = NanoRail(rpc=lambda request: block_info(amount="1"))
@@ -253,11 +283,57 @@ def ledger(*blocks):
 
 
 def test_requirements_get_distinct_amounts_and_ids():
-    """Two requirements for the same price never share an amount or id."""
+    """Outstanding requirements for the same price never share an amount or id."""
     rail = NanoRail()
     reqs = [rail.requirement("1.00", "/r", DEST) for _ in range(20)]
     assert len({r["amount_raw"] for r in reqs}) == 20
     assert len({r["requirement_id"] for r in reqs}) == 20
+
+
+def test_requirement_redraws_a_colliding_tag(monkeypatch):
+    """A tag whose amount is already outstanding is drawn again."""
+    draws = iter([7, 7, 7, 9])
+    monkeypatch.setattr(nano.secrets, "randbelow", lambda n: next(draws))
+    rail = NanoRail()
+    first = rail.requirement("1.00", "/r", DEST)
+    second = rail.requirement("1.00", "/r", DEST)
+    assert first["amount_raw"] == str(10**30 + 8)
+    assert second["amount_raw"] == str(10**30 + 10)
+
+
+def test_same_tag_is_allowed_for_another_destination(monkeypatch):
+    monkeypatch.setattr(nano.secrets, "randbelow", lambda n: 7)
+    rail = NanoRail()
+    a = rail.requirement("1.00", "/r", DEST)
+    b = rail.requirement("1.00", "/r", "nano_1otheraddress")
+    assert a["amount_raw"] == b["amount_raw"]
+
+
+def test_requirement_gives_up_when_no_amount_is_free(monkeypatch):
+    monkeypatch.setattr(nano.secrets, "randbelow", lambda n: 7)
+    rail = NanoRail()
+    rail.requirement("1.00", "/r", DEST)
+    with pytest.raises(ValueError):
+        rail.requirement("1.00", "/r", DEST)
+
+
+def test_settled_and_expired_amounts_are_released(monkeypatch):
+    """An amount is reusable once its requirement settles or expires."""
+    monkeypatch.setattr(nano.secrets, "randbelow", lambda n: 7)
+    rail = NanoRail()
+    req = rail.requirement("1.00", "/r", DEST)
+    rail._rpc = ledger(("h1", req["amount_raw"]))
+    rail.settle(req, "h1")
+    again = rail.requirement("1.00", "/r", DEST, expires_in_seconds=60)
+    assert again["amount_raw"] == req["amount_raw"]
+    with pytest.raises(ValueError):
+        rail.requirement("1.00", "/r", DEST)
+    key = (DEST, again["amount_raw"])
+    rail._outstanding[key] = (
+        again["requirement_id"],
+        datetime(2000, 1, 1, tzinfo=timezone.utc),
+    )
+    assert rail.requirement("1.00", "/r", DEST)["amount_raw"] == req["amount_raw"]
 
 
 def test_settle_confirms_its_own_requirement():

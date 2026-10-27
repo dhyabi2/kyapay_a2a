@@ -359,8 +359,9 @@ rail = NanoRail(rpc=my_rpc, xno_usd="1.0")
 
 # Merchant publishes a Nano payment requirement (parallel to a Skyfire token).
 # The requirement binds the advertised USD price to an exact raw amount,
-# converted with the rail's own rate plus a small random tag (under 10^6 raw)
-# that makes the amount unique to this requirement.
+# converted with the rail's own rate plus a small random tag (under 10^6 raw).
+# The rail re-draws the tag if that amount is already outstanding for this
+# address, so its open requirements never share an amount.
 requirement = rail.requirement(
     price_usd="1.00",
     resource="/api/service",
@@ -381,8 +382,13 @@ and broadcasts the send block; a merchant asks its `rpc` for that block's
 advertised requirement exactly, and the block hash has not been used before
 (one block pays for one delivery; pass `claim=` to back that check with shared
 storage in a multi-process merchant). `settle` also refuses an expired
-requirement and settles each requirement once; because each requirement's
-amount is unique, a block someone paid for another requirement does not match.
+requirement and settles each requirement once. Amounts are distinct among
+the requirements one `NanoRail` has outstanding for an address (an amount is
+freed when its requirement settles or expires; one without an expiry holds it
+until settled), so a block someone paid for another of those requirements does
+not match. Separate rail instances or processes paying to one address do not
+coordinate amounts; give each its own address. `verify` refuses an empty
+block hash, destination or amount before reading the ledger.
 Prices that are zero, negative or below one raw are rejected when the
 requirement is built. The requirement is a plain dict offered next to a
 `KyaPayRequirements`, not one: that model needs a Skyfire `seller_service_id`. This **fails closed** — an unconfigured
