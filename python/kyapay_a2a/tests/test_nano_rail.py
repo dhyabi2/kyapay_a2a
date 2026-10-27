@@ -20,6 +20,7 @@ import pytest
 from kyapay_a2a.rails import nano
 from kyapay_a2a.rails.nano import (
     AMOUNT_TAG_SPAN,
+    InMemoryClaims,
     InMemoryOutstandingAmounts,
     NanoPaymentResult,
     NanoQuote,
@@ -429,14 +430,30 @@ def test_requirement_settles_only_once():
 
 
 def test_expired_requirement_is_refused():
-    rail = NanoRail()
+    start = datetime.now(timezone.utc)
+    clock = [start + timedelta(seconds=61)]
+    rail = NanoRail(clock=lambda: clock[0])
     req = rail.requirement("1.00", "/r", DEST, expires_in_seconds=60)
     rail._rpc = ledger((H1, req["amount_raw"]))
-    later = datetime.now(timezone.utc) + timedelta(seconds=61)
     with pytest.raises(PaymentNotConfirmed, match="expired"):
-        rail.settle(req, H1, now=later)
+        rail.settle(req, H1)
     # Refusing an expired requirement must not consume the block.
+    clock[0] = start
     assert rail.settle(req, H1).settled
+
+
+def test_settle_takes_no_caller_supplied_time():
+    """Expiry cannot be bypassed by handing settle an earlier time."""
+    rail = NanoRail()
+    req = rail.requirement("1.00", "/r", DEST, expires_in_seconds=60)
+    req_expired = dict(req, expires_at="2000-01-01T00:00:00+00:00")
+    rail._rpc = ledger((H1, req["amount_raw"]))
+    with pytest.raises(TypeError):
+        rail.settle(  # type: ignore[call-arg]
+            req_expired, H1, now=datetime(1999, 1, 1, tzinfo=timezone.utc)
+        )
+    with pytest.raises(PaymentNotConfirmed, match="expired"):
+        rail.settle(req_expired, H1)
 
 
 def test_pay_with_requirement_enforces_expiry_and_match():
@@ -521,3 +538,39 @@ def test_store_refusing_every_amount_yields_no_requirement():
 
     with pytest.raises(ValueError):
         NanoRail(outstanding=Full()).requirement("1.00", "/r", DEST)
+
+
+def test_rails_sharing_a_claim_store_refuse_a_replay():
+    """Two rails (standing in for two workers) that share one claim store
+    refuse a block hash the other already settled."""
+    shared = InMemoryClaims()
+    worker_a = NanoRail(rpc=lambda request: block_info(), claim=shared)
+    worker_b = NanoRail(rpc=lambda request: block_info(), claim=shared)
+    assert worker_a.verify(H, destination=DEST, amount_raw=AMOUNT).settled
+    with pytest.raises(PaymentNotConfirmed, match="already used"):
+        worker_b.verify(H.lower(), destination=DEST, amount_raw=AMOUNT)
+
+
+def test_rails_sharing_stores_settle_a_requirement_once():
+    """A requirement issued by one rail and settled there cannot be settled
+    again through another rail sharing its stores, even with a fresh block."""
+    claims, amounts = InMemoryClaims(), InMemoryOutstandingAmounts()
+    worker_a = NanoRail(claim=claims, outstanding=amounts)
+    worker_b = NanoRail(claim=claims, outstanding=amounts)
+    req = worker_a.requirement("1.00", "/r", DEST, expires_in_seconds=60)
+    worker_a._rpc = worker_b._rpc = ledger(
+        (H1, req["amount_raw"]), (H2, req["amount_raw"])
+    )
+    assert worker_a.settle(req, H1).settled
+    with pytest.raises(PaymentNotConfirmed):
+        worker_b.settle(req, H1)
+    with pytest.raises(PaymentNotConfirmed, match="already settled"):
+        worker_b.settle(req, H2)
+
+
+def test_separate_default_claim_stores_do_not_coordinate():
+    """The default claim store is per rail: this is why rails must share one."""
+    a = NanoRail(rpc=lambda request: block_info())
+    b = NanoRail(rpc=lambda request: block_info())
+    assert a.verify(H, destination=DEST, amount_raw=AMOUNT).settled
+    assert b.verify(H, destination=DEST, amount_raw=AMOUNT).settled

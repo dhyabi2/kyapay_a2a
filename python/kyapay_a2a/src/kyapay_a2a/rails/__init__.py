@@ -18,6 +18,7 @@ optional peer-to-peer Nano (XNO) rail that a merchant can offer alongside it.
 """
 
 from .nano import (
+    InMemoryClaims,
     InMemoryOutstandingAmounts,
     NanoPaymentResult,
     NanoQuote,
@@ -30,6 +31,7 @@ from .nano import (
 )
 
 __all__ = [
+    "InMemoryClaims",
     "InMemoryOutstandingAmounts",
     "NanoPaymentResult",
     "NanoQuote",

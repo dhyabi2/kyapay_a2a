@@ -361,7 +361,7 @@ rail = NanoRail(rpc=my_rpc, xno_usd="1.0")
 # The requirement binds the advertised USD price to an exact raw amount,
 # converted with the rail's own rate plus a small random tag (under 10^6 raw).
 # The rail re-draws the tag if that amount is already outstanding for this
-# address (tracked per process by default; see below for multiple workers).
+# address (tracked per rail instance by default; see below for several rails).
 requirement = rail.requirement(
     price_usd="1.00",
     resource="/api/service",
@@ -386,11 +386,15 @@ payment only by its exact amount at its address, so `requirement` reserves
 each amount in an `outstanding` store and re-draws on a collision (an amount
 is freed when its requirement settles or expires; one without an expiry holds
 it until settled). **Both the replay check and the amount store default to
-in-memory, per-process state.** A merchant running several processes or
-workers against one address must pass `claim=` and `outstanding=` (an
-`OutstandingAmounts`) backed by shared storage, such as unique-key inserts;
-otherwise two workers can issue the same amount and one payment could settle a
-requirement in each. Alternatively give each process its own address. `verify`
+in-memory state private to one `NanoRail` instance.** Every rail that settles
+payments to one address must share them: rails in one process by passing the
+same `InMemoryClaims` and `InMemoryOutstandingAmounts` as `claim=` and
+`outstanding=`; several processes or workers by passing a `claim` and an
+`OutstandingAmounts` backed by shared storage, such as unique-key inserts.
+Otherwise two rails can issue the same amount and one payment could settle a
+requirement on each. Alternatively give each rail its own address. Expiry is
+checked against the rail's own clock (`clock=` exists only for tests), never a
+time supplied with the settlement. `verify`
 refuses an empty destination or amount, and any block hash that is not 64 hex
 digits, before reading the ledger; the hash is normalised (stripped, upper
 case) before it is looked up or consumed, so a re-cased or padded copy of a

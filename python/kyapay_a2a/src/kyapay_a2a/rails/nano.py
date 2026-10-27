@@ -135,13 +135,36 @@ class OutstandingAmounts(Protocol):
         ...
 
 
+class InMemoryClaims:
+    """The default ``claim``: a set of consumed keys guarded by a lock.
+
+    Calling it with a key returns ``True`` the first time and ``False`` after.
+    Its scope is the object itself: a ``NanoRail`` built without ``claim``
+    gets its own, so two rails do not see each other's consumed hashes. Rails
+    in one process can share one by passing the same instance as ``claim``;
+    rails in separate processes need a ``claim`` backed by shared storage.
+    """
+
+    def __init__(self) -> None:
+        self._claimed: set[str] = set()
+        self._lock = Lock()
+
+    def __call__(self, key: str) -> bool:
+        with self._lock:
+            if key in self._claimed:
+                return False
+            self._claimed.add(key)
+            return True
+
+
 class InMemoryOutstandingAmounts:
     """The default ``OutstandingAmounts``: a dict guarded by a lock.
 
-    It is per-process. Separate processes or workers that issue requirements
-    for one address do not see each other's amounts and can hand out the same
-    one; they must share an ``OutstandingAmounts`` (and a ``claim``) backed by
-    shared storage, or each use their own address.
+    Its scope is the object itself: a ``NanoRail`` built without
+    ``outstanding`` gets its own. Rails in one process can share one by
+    passing the same instance; separate processes or workers that issue
+    requirements for one address must share an ``OutstandingAmounts`` (and a
+    ``claim``) backed by shared storage, or each use their own address.
     """
 
     def __init__(self) -> None:
@@ -221,13 +244,15 @@ class NanoRail:
     called once per successful verification with the canonical (upper-case)
     hash and must return ``True`` only the first time a key is claimed
     (atomically); ``settle`` also claims ``"requirement:<requirement_id>"``.
-    The default is an in-process set guarded by a lock.
 
-    Both defaults (``claim`` and ``outstanding``) are per-process. A merchant
-    running several processes or workers against one receive address must
-    pass a ``claim`` and an ``outstanding`` backed by shared storage (e.g.
-    unique-key inserts); otherwise two workers can issue the same amount and
-    one payment could settle a requirement in each.
+    Both defaults (``claim`` and ``outstanding``) are in-memory and private to
+    one rail instance: a block consumed by one ``NanoRail`` is unknown to
+    another unless they share these stores. Every rail that settles payments
+    to one receive address must share them - in one process by passing the
+    same ``InMemoryClaims`` / ``InMemoryOutstandingAmounts``, across processes
+    or workers by passing a ``claim`` and an ``outstanding`` backed by shared
+    storage (e.g. unique-key inserts). Otherwise one payment could settle a
+    requirement on each rail.
     """
 
     name = "nano-xno"
@@ -238,6 +263,7 @@ class NanoRail:
         xno_usd: str | float = "1.0",
         claim: Callable[[str], bool] | None = None,
         outstanding: OutstandingAmounts | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         """Build a Nano rail.
 
@@ -250,26 +276,26 @@ class NanoRail:
                 ``requirement`` to convert an advertised USD price to a raw
                 amount. Override in production with a live quote.
             claim: atomic "first use" check for a block hash (see class
-                docstring). Defaults to an in-process set.
+                docstring). Defaults to a new ``InMemoryClaims`` private to
+                this rail.
             outstanding: where ``requirement`` reserves amounts so that no
                 two open requirements for one address share an amount.
-                Defaults to a per-process ``InMemoryOutstandingAmounts``.
+                Defaults to a new ``InMemoryOutstandingAmounts`` private to
+                this rail.
+            clock: returns the current UTC time ``settle`` checks expiry
+                against. Defaults to the system clock; set it only to test.
         """
         self._rpc = rpc or self._stub_no_confirmation
         self._xno_usd = str(xno_usd)
-        self._claimed: set[str] = set()
-        self._claim_lock = Lock()
-        self._claim = claim or self._claim_in_process
+        self._claim: Callable[[str], bool] = (
+            claim if claim is not None else InMemoryClaims()
+        )
         self._outstanding: OutstandingAmounts = (
             outstanding if outstanding is not None else InMemoryOutstandingAmounts()
         )
-
-    def _claim_in_process(self, block_hash: str) -> bool:
-        with self._claim_lock:
-            if block_hash in self._claimed:
-                return False
-            self._claimed.add(block_hash)
-            return True
+        self._clock: Callable[[], datetime] = clock or (
+            lambda: datetime.now(timezone.utc)
+        )
 
     def amount_raw_for(self, price_usd: str | float) -> str:
         """The raw amount this rail expects for ``price_usd`` at its rate."""
@@ -421,8 +447,6 @@ class NanoRail:
         self,
         requirement: dict[str, Any],
         block_hash: str,
-        *,
-        now: datetime | None = None,
     ) -> NanoPaymentResult:
         """Settle ``requirement`` with the buyer's block ``block_hash``.
 
@@ -430,7 +454,9 @@ class NanoRail:
             requirement: a dict from ``requirement`` /
                 ``create_nano_payment_requirement``.
             block_hash: the hash of the buyer's send block.
-            now: the current time (for tests); defaults to UTC now.
+
+        Expiry is checked against the rail's ``clock``; a caller cannot pass
+        its own time.
 
         Raises:
             PaymentNotConfirmed: when the requirement is malformed, expired or
@@ -455,7 +481,7 @@ class NanoRail:
                 ) from exc
             if deadline.tzinfo is None:
                 deadline = deadline.replace(tzinfo=timezone.utc)
-            if (now or datetime.now(timezone.utc)) >= deadline:
+            if self._clock() >= deadline:
                 raise PaymentNotConfirmed("payment requirement has expired")
         result = self.verify(
             block_hash, destination=str(destination), amount_raw=str(amount_raw)
