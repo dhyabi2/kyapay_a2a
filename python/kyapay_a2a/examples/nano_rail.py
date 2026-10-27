@@ -96,7 +96,8 @@ def main() -> None:
     # already settled, and only a block for this requirement's amount matches.
     print("\n-- settling on the Nano rail --")
     try:
-        result = rail.settle(nano_req, "buyer_block_hash")
+        # The 64-hex-digit hash of the buyer's send block (a placeholder here).
+        result = rail.settle(nano_req, "B" * 64)
         print(f"  settled   : {result.settled}")
         print(f"  fee       : ${result.fee_usd:.6f}")
         print(f"  block ref : {result.block_hash}")

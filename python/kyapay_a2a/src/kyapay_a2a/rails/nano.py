@@ -29,13 +29,14 @@ confirmed block for the requested amount and destination is observed; anything
 ambiguous is reported as not settled rather than assumed paid.
 """
 
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal, InvalidOperation, localcontext
 from threading import Lock
-from typing import Any
+from typing import Any, Protocol
 
 # Nano has 10^30 raw per whole XNO.
 RAWS_PER_XNO = 10**30
@@ -47,6 +48,24 @@ AMOUNT_TAG_SPAN = 10**6
 
 # How many tags ``NanoRail.requirement`` draws before giving up.
 _TAG_ATTEMPTS = 64
+
+# A Nano block hash: 32 bytes as 64 hex digits (canonical form is upper case).
+_BLOCK_HASH = re.compile(r"[0-9A-F]{64}")
+
+
+def normalize_block_hash(block_hash: Any) -> str:
+    """Return the canonical (stripped, upper-case) form of a Nano block hash.
+
+    Raises:
+        PaymentNotConfirmed: when ``block_hash`` is not a string of exactly 64
+            hex digits once surrounding whitespace is removed.
+    """
+    if not isinstance(block_hash, str):
+        raise PaymentNotConfirmed("no block hash to verify")
+    canonical = block_hash.strip().upper()
+    if not _BLOCK_HASH.fullmatch(canonical):
+        raise PaymentNotConfirmed("block hash is not 64 hex digits")
+    return canonical
 
 
 def usd_to_raw(price_usd: str | float, xno_usd: str | float) -> str:
@@ -86,6 +105,74 @@ def usd_to_raw(price_usd: str | float, xno_usd: str | float) -> str:
 
 class PaymentNotConfirmed(Exception):
     """Raised when a claimed Nano payment cannot be confirmed on the ledger."""
+
+
+class OutstandingAmounts(Protocol):
+    """Where ``NanoRail.requirement`` reserves the amounts it hands out.
+
+    A requirement is bound to its payment only by its exact amount and
+    destination, so two open requirements must never share both. Every rail
+    (and every process) that issues requirements for one address must use the
+    same store; the default ``InMemoryOutstandingAmounts`` covers one rail in
+    one process only. A shared store is typically a table with a unique key on
+    ``(destination, amount_raw)`` whose expired rows are treated as free.
+    """
+
+    def reserve(
+        self,
+        destination: str,
+        amount_raw: str,
+        requirement_id: str,
+        deadline: datetime | None,
+    ) -> bool:
+        """Atomically reserve ``amount_raw`` at ``destination`` for
+        ``requirement_id`` until ``deadline`` (``None``: until released).
+        Return ``False`` when an unexpired reservation already holds it."""
+        ...
+
+    def release(self, destination: str, amount_raw: str, requirement_id: str) -> None:
+        """Free the reservation if ``requirement_id`` still holds it."""
+        ...
+
+
+class InMemoryOutstandingAmounts:
+    """The default ``OutstandingAmounts``: a dict guarded by a lock.
+
+    It is per-process. Separate processes or workers that issue requirements
+    for one address do not see each other's amounts and can hand out the same
+    one; they must share an ``OutstandingAmounts`` (and a ``claim``) backed by
+    shared storage, or each use their own address.
+    """
+
+    def __init__(self) -> None:
+        # (destination, amount_raw) -> (requirement_id, deadline or None)
+        self._entries: dict[tuple[str, str], tuple[str, datetime | None]] = {}
+        self._lock = Lock()
+
+    def reserve(
+        self,
+        destination: str,
+        amount_raw: str,
+        requirement_id: str,
+        deadline: datetime | None,
+    ) -> bool:
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            for held_key, (_, held_deadline) in list(self._entries.items()):
+                if held_deadline is not None and now >= held_deadline:
+                    del self._entries[held_key]
+            key = (destination, amount_raw)
+            if key in self._entries:
+                return False
+            self._entries[key] = (requirement_id, deadline)
+            return True
+
+    def release(self, destination: str, amount_raw: str, requirement_id: str) -> None:
+        with self._lock:
+            key = (destination, amount_raw)
+            held = self._entries.get(key)
+            if held is not None and held[0] == requirement_id:
+                del self._entries[key]
 
 
 @dataclass
@@ -131,11 +218,16 @@ class NanoRail:
 
     A Nano block is immutable, so one block hash could otherwise authorize
     repeated deliveries. ``verify`` therefore *consumes* the hash: ``claim`` is
-    called once per successful verification and must return ``True`` only the
-    first time a key is claimed (atomically); ``settle`` also claims
-    ``"requirement:<requirement_id>"``. The default is an in-process set
-    guarded by a lock; a multi-process merchant must pass a claim backed by
-    shared storage (e.g. a unique-key insert).
+    called once per successful verification with the canonical (upper-case)
+    hash and must return ``True`` only the first time a key is claimed
+    (atomically); ``settle`` also claims ``"requirement:<requirement_id>"``.
+    The default is an in-process set guarded by a lock.
+
+    Both defaults (``claim`` and ``outstanding``) are per-process. A merchant
+    running several processes or workers against one receive address must
+    pass a ``claim`` and an ``outstanding`` backed by shared storage (e.g.
+    unique-key inserts); otherwise two workers can issue the same amount and
+    one payment could settle a requirement in each.
     """
 
     name = "nano-xno"
@@ -145,6 +237,7 @@ class NanoRail:
         rpc: Callable[..., Any] | None = None,
         xno_usd: str | float = "1.0",
         claim: Callable[[str], bool] | None = None,
+        outstanding: OutstandingAmounts | None = None,
     ) -> None:
         """Build a Nano rail.
 
@@ -158,16 +251,18 @@ class NanoRail:
                 amount. Override in production with a live quote.
             claim: atomic "first use" check for a block hash (see class
                 docstring). Defaults to an in-process set.
+            outstanding: where ``requirement`` reserves amounts so that no
+                two open requirements for one address share an amount.
+                Defaults to a per-process ``InMemoryOutstandingAmounts``.
         """
         self._rpc = rpc or self._stub_no_confirmation
         self._xno_usd = str(xno_usd)
         self._claimed: set[str] = set()
         self._claim_lock = Lock()
         self._claim = claim or self._claim_in_process
-        # (destination, amount_raw) -> (requirement_id, deadline or None) for
-        # requirements built by this rail and not yet settled or expired.
-        self._outstanding: dict[tuple[str, str], tuple[str, datetime | None]] = {}
-        self._outstanding_lock = Lock()
+        self._outstanding: OutstandingAmounts = (
+            outstanding if outstanding is not None else InMemoryOutstandingAmounts()
+        )
 
     def _claim_in_process(self, block_hash: str) -> bool:
         with self._claim_lock:
@@ -187,45 +282,33 @@ class NanoRail:
         amount and the amount ``verify`` is later called with share one
         conversion path.
 
-        The rail tracks the tagged amounts of its outstanding requirements per
-        destination and re-draws the tag on a collision, so no two outstanding
-        requirements from this rail share an amount and destination. An amount
-        is released when its requirement settles or expires; a requirement
-        without ``expires_in_seconds`` holds its amount until it settles. The
-        tracking is in-process: separate rail instances (or processes) paying
-        to one address do not see each other's amounts.
+        The rail reserves each tagged amount in its ``outstanding`` store and
+        re-draws the tag on a collision, so no two outstanding requirements
+        sharing that store have the same amount and destination. An amount is
+        released when its requirement settles or expires; a requirement
+        without ``expires_in_seconds`` holds its amount until it settles. With
+        the default store this holds only within one process (see
+        ``InMemoryOutstandingAmounts``).
 
         Raises:
             ValueError: as ``create_nano_payment_requirement``, or when no
                 free amount was found for this price and destination.
         """
-        with self._outstanding_lock:
-            now = datetime.now(timezone.utc)
-            for key, (_, deadline) in list(self._outstanding.items()):
-                if deadline is not None and now >= deadline:
-                    del self._outstanding[key]
-            for _ in range(_TAG_ATTEMPTS):
-                req = create_nano_payment_requirement(
-                    price_usd, resource, nano_address, xno_usd=self._xno_usd, **kwargs
-                )
-                key = (str(req["nano_address"]), str(req["amount_raw"]))
-                if key not in self._outstanding:
-                    deadline = (
-                        datetime.fromisoformat(req["expires_at"])
-                        if req["expires_at"]
-                        else None
-                    )
-                    self._outstanding[key] = (req["requirement_id"], deadline)
-                    return req
+        for _ in range(_TAG_ATTEMPTS):
+            req = create_nano_payment_requirement(
+                price_usd, resource, nano_address, xno_usd=self._xno_usd, **kwargs
+            )
+            deadline = (
+                datetime.fromisoformat(req["expires_at"]) if req["expires_at"] else None
+            )
+            if self._outstanding.reserve(
+                str(req["nano_address"]),
+                str(req["amount_raw"]),
+                str(req["requirement_id"]),
+                deadline,
+            ):
+                return req
         raise ValueError("no free amount for this price and destination")
-
-    def _release(self, destination: str, amount_raw: str, requirement_id: str) -> None:
-        """Free a settled requirement's amount for reuse."""
-        with self._outstanding_lock:
-            key = (destination, amount_raw)
-            entry = self._outstanding.get(key)
-            if entry is not None and entry[0] == requirement_id:
-                del self._outstanding[key]
 
     @staticmethod
     def _stub_no_confirmation(request: dict[str, Any]) -> dict[str, Any]:
@@ -267,7 +350,9 @@ class NanoRail:
         """Confirm a Nano payment block against the merchant's requirement.
 
         Args:
-            block_hash: the hash of the buyer's send block.
+            block_hash: the hash of the buyer's send block (64 hex digits;
+                case and surrounding whitespace are normalised away, so the
+                canonical upper-case form is what is queried and consumed).
             destination: the merchant's Nano (XNO) receive address.
             amount_raw: the raw amount the merchant expects (e.g. from
                 ``usd_to_raw`` of the advertised price).
@@ -278,13 +363,12 @@ class NanoRail:
             match, and the block hash has not been used before.
 
         Raises:
-            PaymentNotConfirmed: when an argument is empty or ``amount_raw``
-            is not a positive integer, or the block does not exist, is not
+            PaymentNotConfirmed: when an argument is empty, ``block_hash`` is
+            not 64 hex digits, ``amount_raw`` is not a positive integer, or the block does not exist, is not
             confirmed, is not a send, does not match the expected
             amount/destination, or was already consumed.
         """
-        if not isinstance(block_hash, str) or not block_hash:
-            raise PaymentNotConfirmed("no block hash to verify")
+        block_hash = normalize_block_hash(block_hash)
         if not isinstance(destination, str) or not destination:
             raise PaymentNotConfirmed("no destination to verify against")
         amount_raw = "" if amount_raw is None else str(amount_raw)
@@ -378,7 +462,9 @@ class NanoRail:
         )
         if not self._claim(f"requirement:{requirement_id}"):
             raise PaymentNotConfirmed("payment requirement was already settled")
-        self._release(str(destination), str(amount_raw), str(requirement_id))
+        self._outstanding.release(
+            str(destination), str(amount_raw), str(requirement_id)
+        )
         return result
 
     # Pay is intentionally not a signing operation on the merchant side. The

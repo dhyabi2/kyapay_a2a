@@ -18,19 +18,25 @@ optional peer-to-peer Nano (XNO) rail that a merchant can offer alongside it.
 """
 
 from .nano import (
+    InMemoryOutstandingAmounts,
     NanoPaymentResult,
     NanoQuote,
     NanoRail,
+    OutstandingAmounts,
     PaymentNotConfirmed,
     create_nano_payment_requirement,
+    normalize_block_hash,
     usd_to_raw,
 )
 
 __all__ = [
+    "InMemoryOutstandingAmounts",
     "NanoPaymentResult",
     "NanoQuote",
     "NanoRail",
+    "OutstandingAmounts",
     "PaymentNotConfirmed",
     "create_nano_payment_requirement",
+    "normalize_block_hash",
     "usd_to_raw",
 ]

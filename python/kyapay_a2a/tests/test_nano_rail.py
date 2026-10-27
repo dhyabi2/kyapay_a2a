@@ -20,6 +20,7 @@ import pytest
 from kyapay_a2a.rails import nano
 from kyapay_a2a.rails.nano import (
     AMOUNT_TAG_SPAN,
+    InMemoryOutstandingAmounts,
     NanoPaymentResult,
     NanoQuote,
     NanoRail,
@@ -29,6 +30,12 @@ from kyapay_a2a.rails.nano import (
 )
 
 DEST = "nano_1exampleaddress"
+
+# Canonical (upper-case, 64 hex digit) Nano block hashes.
+H = "DEADBEEF" * 8
+H1 = "1" * 64
+H2 = "2" * 64
+H3 = "ABC" + "0" * 61
 
 
 def test_nano_quote_is_feeless_and_fast():
@@ -46,7 +53,7 @@ def test_unconfigured_rail_fails_closed():
     rail = NanoRail()
     with pytest.raises(PaymentNotConfirmed):
         rail.verify(
-            "deadbeef",
+            H,
             destination=DEST,
             amount_raw="1000000000000000000000000",
         )
@@ -79,11 +86,11 @@ def test_verify_confirms_a_matching_block():
         return block_info()
 
     rail = NanoRail(rpc=fake_rpc)
-    result = rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
+    result = rail.verify(H, destination=DEST, amount_raw=AMOUNT)
     assert isinstance(result, NanoPaymentResult)
     assert result.settled is True
     assert result.rail == "nano-xno"
-    assert result.block_hash == "deadbeef"
+    assert result.block_hash == H
     assert result.amount_raw == AMOUNT
 
 
@@ -98,9 +105,7 @@ def test_legacy_send_block_uses_destination_field():
         }
 
     assert (
-        NanoRail(rpc=fake_rpc)
-        .verify("abc", destination=DEST, amount_raw=AMOUNT)
-        .settled
+        NanoRail(rpc=fake_rpc).verify(H3, destination=DEST, amount_raw=AMOUNT).settled
     )
 
 
@@ -114,7 +119,7 @@ def test_amount_is_read_from_top_level_not_contents():
         return reply
 
     with pytest.raises(PaymentNotConfirmed):
-        NanoRail(rpc=fake_rpc).verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
+        NanoRail(rpc=fake_rpc).verify(H, destination=DEST, amount_raw=AMOUNT)
 
 
 @pytest.mark.parametrize("confirmed", ["false", False, None, ""])
@@ -128,50 +133,50 @@ def test_unconfirmed_block_fails_closed(confirmed):
         return reply
 
     with pytest.raises(PaymentNotConfirmed):
-        NanoRail(rpc=fake_rpc).verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
+        NanoRail(rpc=fake_rpc).verify(H, destination=DEST, amount_raw=AMOUNT)
 
 
 def test_non_send_block_fails_closed():
     """A receive (or any non-send) block is not a payment."""
     rail = NanoRail(rpc=lambda request: block_info(subtype="receive"))
     with pytest.raises(PaymentNotConfirmed):
-        rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
+        rail.verify(H, destination=DEST, amount_raw=AMOUNT)
 
 
 def test_amount_mismatch_fails_closed():
     """A block whose amount differs from the advertised price must not settle."""
     rail = NanoRail(rpc=lambda request: block_info(amount="500000000000000000000000"))
     with pytest.raises(PaymentNotConfirmed):
-        rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
+        rail.verify(H, destination=DEST, amount_raw=AMOUNT)
 
 
 def test_destination_mismatch_fails_closed():
     """A block sent to the wrong address must not settle."""
     rail = NanoRail(rpc=lambda request: block_info(destination="nano_1someoneelse"))
     with pytest.raises(PaymentNotConfirmed):
-        rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
+        rail.verify(H, destination=DEST, amount_raw=AMOUNT)
 
 
 def test_missing_destination_fails_closed():
     """A block with no recipient field must not settle for any address."""
     rail = NanoRail(rpc=lambda request: block_info(destination=None))
     with pytest.raises(PaymentNotConfirmed):
-        rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
+        rail.verify(H, destination=DEST, amount_raw=AMOUNT)
 
 
 def test_block_hash_settles_only_once():
     """One immutable block pays for one delivery: a replay is refused."""
     rail = NanoRail(rpc=lambda request: block_info())
-    assert rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT).settled
+    assert rail.verify(H, destination=DEST, amount_raw=AMOUNT).settled
     with pytest.raises(PaymentNotConfirmed):
-        rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
+        rail.verify(H, destination=DEST, amount_raw=AMOUNT)
 
 
 def test_custom_claim_is_consulted():
     """A shared-storage claim can refuse a hash another process consumed."""
     rail = NanoRail(rpc=lambda request: block_info(), claim=lambda block_hash: False)
     with pytest.raises(PaymentNotConfirmed):
-        rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
+        rail.verify(H, destination=DEST, amount_raw=AMOUNT)
 
 
 def test_failed_verification_does_not_consume_the_hash():
@@ -179,8 +184,8 @@ def test_failed_verification_does_not_consume_the_hash():
     replies = [block_info(confirmed="false"), block_info()]
     rail = NanoRail(rpc=lambda request: replies.pop(0))
     with pytest.raises(PaymentNotConfirmed):
-        rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT)
-    assert rail.verify("deadbeef", destination=DEST, amount_raw=AMOUNT).settled
+        rail.verify(H, destination=DEST, amount_raw=AMOUNT)
+    assert rail.verify(H, destination=DEST, amount_raw=AMOUNT).settled
 
 
 @pytest.mark.parametrize(
@@ -188,14 +193,22 @@ def test_failed_verification_does_not_consume_the_hash():
     [
         ("", DEST, AMOUNT),
         (None, DEST, AMOUNT),
-        ("deadbeef", "", AMOUNT),
-        ("deadbeef", None, AMOUNT),
-        ("deadbeef", DEST, ""),
-        ("deadbeef", DEST, None),
-        ("deadbeef", DEST, "0"),
-        ("deadbeef", DEST, "-1"),
-        ("deadbeef", DEST, "1.5"),
+        (H, "", AMOUNT),
+        (H, None, AMOUNT),
+        (H, DEST, ""),
+        (H, DEST, None),
+        (H, DEST, "0"),
+        (H, DEST, "-1"),
+        (H, DEST, "1.5"),
         ("", "", ""),
+        ("deadbeef", DEST, AMOUNT),
+        ("A" * 63, DEST, AMOUNT),
+        ("A" * 65, DEST, AMOUNT),
+        ("G" * 64, DEST, AMOUNT),
+        ("0x" + "A" * 62, DEST, AMOUNT),
+        ("A" * 32 + " " + "A" * 31, DEST, AMOUNT),
+        ("\uff21" * 64, DEST, AMOUNT),
+        (123, DEST, AMOUNT),
     ],
 )
 def test_verify_rejects_empty_or_missing_inputs(block_hash, destination, amount_raw):
@@ -210,6 +223,51 @@ def test_verify_rejects_empty_or_missing_inputs(block_hash, destination, amount_
     with pytest.raises(PaymentNotConfirmed):
         rail.verify(block_hash, destination=destination, amount_raw=amount_raw)
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "variant", [H.lower(), f"  {H}  ", f"{H}\n", f"\t{H.lower()} ", H.title()]
+)
+def test_noncanonical_hash_replay_is_refused(variant):
+    """A re-cased or padded copy of a consumed hash is the same block."""
+    queried = []
+
+    def rpc(request):
+        queried.append(request["hash"])
+        return block_info()
+
+    rail = NanoRail(rpc=rpc)
+    assert rail.verify(H, destination=DEST, amount_raw=AMOUNT).settled
+    with pytest.raises(PaymentNotConfirmed, match="already used"):
+        rail.verify(variant, destination=DEST, amount_raw=AMOUNT)
+    assert queried == [H, H]
+
+
+def test_noncanonical_hash_is_normalised_before_claim():
+    """The first use of a hash is consumed in canonical form, so the
+    canonical form is refused afterwards."""
+    claimed = []
+
+    def claim(key):
+        claimed.append(key)
+        return claimed.count(key) == 1
+
+    rail = NanoRail(rpc=lambda request: block_info(), claim=claim)
+    result = rail.verify(f" {H.lower()} ", destination=DEST, amount_raw=AMOUNT)
+    assert result.block_hash == H
+    with pytest.raises(PaymentNotConfirmed):
+        rail.verify(H, destination=DEST, amount_raw=AMOUNT)
+    assert claimed == [H, H]
+
+
+def test_settle_refuses_noncanonical_replay_of_a_requirement_block():
+    rail = NanoRail()
+    req = rail.requirement("1.00", "/r", DEST)
+    rail._rpc = ledger((H1, req["amount_raw"]))
+    assert rail.settle(req, H1.lower()).settled
+    other = dict(req, requirement_id="f" * 32)
+    with pytest.raises(PaymentNotConfirmed):
+        rail.settle(other, f" {H1} ")
 
 
 def test_pay_requires_a_block_hash():
@@ -239,7 +297,7 @@ def test_usd_to_raw_conversion():
 
 
 @pytest.mark.parametrize(
-    "price", ["0", "-1", "0.0000000000000000000000000000009", "NaN", "abc"]
+    "price", ["0", "-1", "0.0000000000000000000000000000009", "NaN", H3]
 )
 def test_usd_to_raw_rejects_unpayable_prices(price):
     """Non-positive, sub-raw and non-numeric prices are refused, not settled."""
@@ -282,11 +340,14 @@ def ledger(*blocks):
     return rpc
 
 
-def test_requirements_get_distinct_amounts_and_ids():
-    """Outstanding requirements for the same price never share an amount or id."""
+def test_requirements_get_distinct_amounts_and_ids(monkeypatch):
+    """Outstanding requirements for the same price never share an amount or id,
+    even when the tag source repeats itself (draws are scripted, not random)."""
+    draws = iter([i // 2 for i in range(40)])  # 0, 0, 1, 1, 2, 2, ...
+    monkeypatch.setattr(nano.secrets, "randbelow", lambda n: next(draws))
     rail = NanoRail()
     reqs = [rail.requirement("1.00", "/r", DEST) for _ in range(20)]
-    assert len({r["amount_raw"] for r in reqs}) == 20
+    assert [r["amount_raw"] for r in reqs] == [str(10**30 + 1 + i) for i in range(20)]
     assert len({r["requirement_id"] for r in reqs}) == 20
 
 
@@ -320,16 +381,17 @@ def test_requirement_gives_up_when_no_amount_is_free(monkeypatch):
 def test_settled_and_expired_amounts_are_released(monkeypatch):
     """An amount is reusable once its requirement settles or expires."""
     monkeypatch.setattr(nano.secrets, "randbelow", lambda n: 7)
-    rail = NanoRail()
+    store = InMemoryOutstandingAmounts()
+    rail = NanoRail(outstanding=store)
     req = rail.requirement("1.00", "/r", DEST)
-    rail._rpc = ledger(("h1", req["amount_raw"]))
-    rail.settle(req, "h1")
+    rail._rpc = ledger((H1, req["amount_raw"]))
+    rail.settle(req, H1)
     again = rail.requirement("1.00", "/r", DEST, expires_in_seconds=60)
     assert again["amount_raw"] == req["amount_raw"]
     with pytest.raises(ValueError):
         rail.requirement("1.00", "/r", DEST)
     key = (DEST, again["amount_raw"])
-    rail._outstanding[key] = (
+    store._entries[key] = (
         again["requirement_id"],
         datetime(2000, 1, 1, tzinfo=timezone.utc),
     )
@@ -339,8 +401,8 @@ def test_settled_and_expired_amounts_are_released(monkeypatch):
 def test_settle_confirms_its_own_requirement():
     rail = NanoRail()
     req = rail.requirement("1.00", "/r", DEST, expires_in_seconds=60)
-    rail._rpc = ledger(("h1", req["amount_raw"]))
-    result = rail.settle(req, "h1")
+    rail._rpc = ledger((H1, req["amount_raw"]))
+    result = rail.settle(req, H1)
     assert result.settled and result.amount_raw == req["amount_raw"]
 
 
@@ -350,43 +412,43 @@ def test_block_for_one_requirement_does_not_settle_another():
     rail = NanoRail()
     paid = rail.requirement("1.00", "/r", DEST)
     other = rail.requirement("1.00", "/r", DEST)
-    rail._rpc = ledger(("h1", paid["amount_raw"]))
+    rail._rpc = ledger((H1, paid["amount_raw"]))
     with pytest.raises(PaymentNotConfirmed):
-        rail.settle(other, "h1")
-    assert rail.settle(paid, "h1").settled
+        rail.settle(other, H1)
+    assert rail.settle(paid, H1).settled
 
 
 def test_requirement_settles_only_once():
     """A second block for an already-settled requirement delivers nothing."""
     rail = NanoRail()
     req = rail.requirement("1.00", "/r", DEST)
-    rail._rpc = ledger(("h1", req["amount_raw"]), ("h2", req["amount_raw"]))
-    assert rail.settle(req, "h1").settled
+    rail._rpc = ledger((H1, req["amount_raw"]), (H2, req["amount_raw"]))
+    assert rail.settle(req, H1).settled
     with pytest.raises(PaymentNotConfirmed):
-        rail.settle(req, "h2")
+        rail.settle(req, H2)
 
 
 def test_expired_requirement_is_refused():
     rail = NanoRail()
     req = rail.requirement("1.00", "/r", DEST, expires_in_seconds=60)
-    rail._rpc = ledger(("h1", req["amount_raw"]))
+    rail._rpc = ledger((H1, req["amount_raw"]))
     later = datetime.now(timezone.utc) + timedelta(seconds=61)
     with pytest.raises(PaymentNotConfirmed, match="expired"):
-        rail.settle(req, "h1", now=later)
+        rail.settle(req, H1, now=later)
     # Refusing an expired requirement must not consume the block.
-    assert rail.settle(req, "h1").settled
+    assert rail.settle(req, H1).settled
 
 
 def test_pay_with_requirement_enforces_expiry_and_match():
     rail = NanoRail()
     req = rail.requirement("1.00", "/r", DEST, expires_in_seconds=60)
     req_expired = dict(req, expires_at="2000-01-01T00:00:00+00:00")
-    rail._rpc = ledger(("h1", req["amount_raw"]))
+    rail._rpc = ledger((H1, req["amount_raw"]))
     with pytest.raises(PaymentNotConfirmed, match="expired"):
-        rail.pay(DEST, req["amount_raw"], "h1", requirement=req_expired)
+        rail.pay(DEST, req["amount_raw"], H1, requirement=req_expired)
     with pytest.raises(PaymentNotConfirmed):
-        rail.pay(DEST, "1", "h1", requirement=req)
-    assert rail.pay(DEST, req["amount_raw"], "h1", requirement=req).settled
+        rail.pay(DEST, "1", H1, requirement=req)
+    assert rail.pay(DEST, req["amount_raw"], H1, requirement=req).settled
 
 
 @pytest.mark.parametrize(
@@ -396,6 +458,66 @@ def test_pay_with_requirement_enforces_expiry_and_match():
 def test_malformed_requirement_fails_closed(broken):
     rail = NanoRail()
     req = rail.requirement("1.00", "/r", DEST)
-    rail._rpc = ledger(("h1", req["amount_raw"]))
+    rail._rpc = ledger((H1, req["amount_raw"]))
     with pytest.raises(PaymentNotConfirmed):
-        rail.settle(dict(req, **broken), "h1")
+        rail.settle(dict(req, **broken), H1)
+
+
+def test_rails_sharing_an_outstanding_store_never_share_an_amount(monkeypatch):
+    """Two rails (standing in for two workers) that share one store cannot
+    issue the same amount for one address."""
+    monkeypatch.setattr(nano.secrets, "randbelow", lambda n: 7)
+    shared = InMemoryOutstandingAmounts()
+    worker_a = NanoRail(outstanding=shared)
+    worker_b = NanoRail(outstanding=shared)
+    worker_a.requirement("1.00", "/r", DEST)
+    with pytest.raises(ValueError):
+        worker_b.requirement("1.00", "/r", DEST)
+
+
+def test_separate_default_stores_do_not_coordinate(monkeypatch):
+    """The default store is per rail: this is why workers must share one."""
+    monkeypatch.setattr(nano.secrets, "randbelow", lambda n: 7)
+    a = NanoRail().requirement("1.00", "/r", DEST)
+    b = NanoRail().requirement("1.00", "/r", DEST)
+    assert a["amount_raw"] == b["amount_raw"]
+
+
+def test_custom_outstanding_store_is_used():
+    """An injected store sees every reservation and every release."""
+
+    class Store:
+        def __init__(self):
+            self.reserved = []
+            self.released = []
+
+        def reserve(self, destination, amount_raw, requirement_id, deadline):
+            if self.reserved:  # pretend the first amount is taken elsewhere
+                self.reserved.append((destination, amount_raw, requirement_id))
+                return True
+            self.reserved.append(None)
+            return False
+
+        def release(self, destination, amount_raw, requirement_id):
+            self.released.append((destination, amount_raw, requirement_id))
+
+    store = Store()
+    rail = NanoRail(outstanding=store)
+    req = rail.requirement("1.00", "/r", DEST, expires_in_seconds=60)
+    held = (DEST, req["amount_raw"], req["requirement_id"])
+    assert store.reserved == [None, held]
+    rail._rpc = ledger((H1, req["amount_raw"]))
+    assert rail.settle(req, H1).settled
+    assert store.released == [held]
+
+
+def test_store_refusing_every_amount_yields_no_requirement():
+    class Full:
+        def reserve(self, *args):
+            return False
+
+        def release(self, *args):
+            raise AssertionError("nothing was reserved")
+
+    with pytest.raises(ValueError):
+        NanoRail(outstanding=Full()).requirement("1.00", "/r", DEST)

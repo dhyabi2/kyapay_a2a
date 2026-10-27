@@ -361,7 +361,7 @@ rail = NanoRail(rpc=my_rpc, xno_usd="1.0")
 # The requirement binds the advertised USD price to an exact raw amount,
 # converted with the rail's own rate plus a small random tag (under 10^6 raw).
 # The rail re-draws the tag if that amount is already outstanding for this
-# address, so its open requirements never share an amount.
+# address (tracked per process by default; see below for multiple workers).
 requirement = rail.requirement(
     price_usd="1.00",
     resource="/api/service",
@@ -371,7 +371,7 @@ requirement = rail.requirement(
 
 quote = rail.quote(1.00)                    # fee $0.00, finality 0.3s
 # The buyer sends exactly requirement["amount_raw"] and hands back the hash.
-result = rail.settle(requirement, "buyer_block_hash")
+result = rail.settle(requirement, buyer_block_hash)  # 64 hex digits
 print(result.settled, result.block_hash)    # True <block hash>
 ```
 
@@ -380,15 +380,21 @@ and broadcasts the send block; a merchant asks its `rpc` for that block's
 `block_info` and only reports `settled=True` when the node marks the block
 `confirmed`, it is a send, its recipient and top-level `amount` match the
 advertised requirement exactly, and the block hash has not been used before
-(one block pays for one delivery; pass `claim=` to back that check with shared
-storage in a multi-process merchant). `settle` also refuses an expired
-requirement and settles each requirement once. Amounts are distinct among
-the requirements one `NanoRail` has outstanding for an address (an amount is
-freed when its requirement settles or expires; one without an expiry holds it
-until settled), so a block someone paid for another of those requirements does
-not match. Separate rail instances or processes paying to one address do not
-coordinate amounts; give each its own address. `verify` refuses an empty
-block hash, destination or amount before reading the ledger.
+(one block pays for one delivery). `settle` also refuses an expired
+requirement and settles each requirement once. A requirement is bound to its
+payment only by its exact amount at its address, so `requirement` reserves
+each amount in an `outstanding` store and re-draws on a collision (an amount
+is freed when its requirement settles or expires; one without an expiry holds
+it until settled). **Both the replay check and the amount store default to
+in-memory, per-process state.** A merchant running several processes or
+workers against one address must pass `claim=` and `outstanding=` (an
+`OutstandingAmounts`) backed by shared storage, such as unique-key inserts;
+otherwise two workers can issue the same amount and one payment could settle a
+requirement in each. Alternatively give each process its own address. `verify`
+refuses an empty destination or amount, and any block hash that is not 64 hex
+digits, before reading the ledger; the hash is normalised (stripped, upper
+case) before it is looked up or consumed, so a re-cased or padded copy of a
+used hash is refused as a replay.
 Prices that are zero, negative or below one raw are rejected when the
 requirement is built. The requirement is a plain dict offered next to a
 `KyaPayRequirements`, not one: that model needs a Skyfire `seller_service_id`. This **fails closed** — an unconfigured
