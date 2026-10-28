@@ -361,7 +361,7 @@ rail = NanoRail(rpc=my_rpc, xno_usd="1.0")
 # The requirement binds the advertised USD price to an exact raw amount,
 # converted with the rail's own rate plus a small random tag (under 10^6 raw).
 # The rail re-draws the tag if that amount is already outstanding for this
-# address (tracked per rail instance by default; see below for several rails).
+# address (tracked per process by default; see below for several workers).
 requirement = rail.requirement(
     price_usd="1.00",
     resource="/api/service",
@@ -386,15 +386,17 @@ payment only by its exact amount at its address, so `requirement` reserves
 each amount in an `outstanding` store and re-draws on a collision (an amount
 is freed when its requirement settles or expires; one without an expiry holds
 it until settled). **Both the replay check and the amount store default to
-in-memory state private to one `NanoRail` instance.** Every rail that settles
-payments to one address must share them: rails in one process by passing the
-same `InMemoryClaims` and `InMemoryOutstandingAmounts` as `claim=` and
-`outstanding=`; several processes or workers by passing a `claim` and an
-`OutstandingAmounts` backed by shared storage, such as unique-key inserts.
-Otherwise two rails can issue the same amount and one payment could settle a
-requirement on each. Alternatively give each rail its own address. Expiry is
-checked against the rail's own clock (`clock=` exists only for tests), never a
-time supplied with the settlement. `verify`
+in-memory state shared by every `NanoRail` in the process** that is built
+without its own `claim=` / `outstanding=`, so two rails in one process refuse
+each other's used block hashes and settled requirements. That state does not
+leave the process: several processes or workers that settle payments to one
+address must pass a `claim` and an `OutstandingAmounts` backed by shared
+storage, such as unique-key inserts, or each use their own address. Otherwise
+two workers can issue the same amount and one payment could settle a
+requirement on each. Expiry is checked against the rail's own clock (`clock=`
+exists only for tests), never a time supplied with the settlement; only a
+missing or `None` `expires_at` means "no expiry" - any other value that is not
+an ISO 8601 time (including `""`, `0` or `False`) is refused. `verify`
 refuses an empty destination or amount, and any block hash that is not 64 hex
 digits, before reading the ledger; the hash is normalised (stripped, upper
 case) before it is looked up or consumed, so a re-cased or padded copy of a

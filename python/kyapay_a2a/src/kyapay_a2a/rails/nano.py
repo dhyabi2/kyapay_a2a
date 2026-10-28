@@ -113,8 +113,8 @@ class OutstandingAmounts(Protocol):
     A requirement is bound to its payment only by its exact amount and
     destination, so two open requirements must never share both. Every rail
     (and every process) that issues requirements for one address must use the
-    same store; the default ``InMemoryOutstandingAmounts`` covers one rail in
-    one process only. A shared store is typically a table with a unique key on
+    same store; the default (one process-wide ``InMemoryOutstandingAmounts``)
+    covers one process only. A shared store is typically a table with a unique key on
     ``(destination, amount_raw)`` whose expired rows are treated as free.
     """
 
@@ -139,10 +139,10 @@ class InMemoryClaims:
     """The default ``claim``: a set of consumed keys guarded by a lock.
 
     Calling it with a key returns ``True`` the first time and ``False`` after.
-    Its scope is the object itself: a ``NanoRail`` built without ``claim``
-    gets its own, so two rails do not see each other's consumed hashes. Rails
-    in one process can share one by passing the same instance as ``claim``;
-    rails in separate processes need a ``claim`` backed by shared storage.
+    Its scope is the object itself. Every ``NanoRail`` built without ``claim``
+    uses one process-wide instance, so rails in one process see each other's
+    consumed hashes; rails in separate processes or workers need a ``claim``
+    backed by shared storage.
     """
 
     def __init__(self) -> None:
@@ -160,9 +160,9 @@ class InMemoryClaims:
 class InMemoryOutstandingAmounts:
     """The default ``OutstandingAmounts``: a dict guarded by a lock.
 
-    Its scope is the object itself: a ``NanoRail`` built without
-    ``outstanding`` gets its own. Rails in one process can share one by
-    passing the same instance; separate processes or workers that issue
+    Its scope is the object itself. Every ``NanoRail`` built without
+    ``outstanding`` uses one process-wide instance, so rails in one process
+    coordinate; separate processes or workers that issue
     requirements for one address must share an ``OutstandingAmounts`` (and a
     ``claim``) backed by shared storage, or each use their own address.
     """
@@ -196,6 +196,15 @@ class InMemoryOutstandingAmounts:
             held = self._entries.get(key)
             if held is not None and held[0] == requirement_id:
                 del self._entries[key]
+
+
+# The process-wide default stores. Every ``NanoRail`` built without ``claim``
+# (or ``outstanding``) uses these same objects, so rails in one process refuse
+# each other's consumed block hashes and settled requirements, and never issue
+# the same amount for one address. Workers in separate processes still need
+# stores backed by shared storage.
+_DEFAULT_CLAIMS = InMemoryClaims()
+_DEFAULT_OUTSTANDING = InMemoryOutstandingAmounts()
 
 
 @dataclass
@@ -245,14 +254,15 @@ class NanoRail:
     hash and must return ``True`` only the first time a key is claimed
     (atomically); ``settle`` also claims ``"requirement:<requirement_id>"``.
 
-    Both defaults (``claim`` and ``outstanding``) are in-memory and private to
-    one rail instance: a block consumed by one ``NanoRail`` is unknown to
-    another unless they share these stores. Every rail that settles payments
-    to one receive address must share them - in one process by passing the
-    same ``InMemoryClaims`` / ``InMemoryOutstandingAmounts``, across processes
-    or workers by passing a ``claim`` and an ``outstanding`` backed by shared
-    storage (e.g. unique-key inserts). Otherwise one payment could settle a
-    requirement on each rail.
+    Both defaults (``claim`` and ``outstanding``) are in-memory stores shared
+    by every ``NanoRail`` in the process that was built without its own: a
+    block consumed by one such rail is refused by the others. That state does
+    not leave the process, so rails in separate processes or workers that
+    settle payments to one receive address must pass a ``claim`` and an
+    ``outstanding`` backed by shared storage (e.g. unique-key inserts), or
+    each use their own address; otherwise one payment could settle a
+    requirement in each process. A rail given its own store does not consult
+    the process-wide default.
     """
 
     name = "nano-xno"
@@ -276,22 +286,22 @@ class NanoRail:
                 ``requirement`` to convert an advertised USD price to a raw
                 amount. Override in production with a live quote.
             claim: atomic "first use" check for a block hash (see class
-                docstring). Defaults to a new ``InMemoryClaims`` private to
-                this rail.
+                docstring). Defaults to the process-wide ``InMemoryClaims``
+                shared by every rail built without one.
             outstanding: where ``requirement`` reserves amounts so that no
                 two open requirements for one address share an amount.
-                Defaults to a new ``InMemoryOutstandingAmounts`` private to
-                this rail.
+                Defaults to the process-wide ``InMemoryOutstandingAmounts``
+                shared by every rail built without one.
             clock: returns the current UTC time ``settle`` checks expiry
                 against. Defaults to the system clock; set it only to test.
         """
         self._rpc = rpc or self._stub_no_confirmation
         self._xno_usd = str(xno_usd)
         self._claim: Callable[[str], bool] = (
-            claim if claim is not None else InMemoryClaims()
+            claim if claim is not None else _DEFAULT_CLAIMS
         )
         self._outstanding: OutstandingAmounts = (
-            outstanding if outstanding is not None else InMemoryOutstandingAmounts()
+            outstanding if outstanding is not None else _DEFAULT_OUTSTANDING
         )
         self._clock: Callable[[], datetime] = clock or (
             lambda: datetime.now(timezone.utc)
@@ -313,8 +323,8 @@ class NanoRail:
         sharing that store have the same amount and destination. An amount is
         released when its requirement settles or expires; a requirement
         without ``expires_in_seconds`` holds its amount until it settles. With
-        the default store this holds only within one process (see
-        ``InMemoryOutstandingAmounts``).
+        the default (process-wide) store this holds only within one process
+        (see ``InMemoryOutstandingAmounts``).
 
         Raises:
             ValueError: as ``create_nano_payment_requirement``, or when no
@@ -325,7 +335,9 @@ class NanoRail:
                 price_usd, resource, nano_address, xno_usd=self._xno_usd, **kwargs
             )
             deadline = (
-                datetime.fromisoformat(req["expires_at"]) if req["expires_at"] else None
+                datetime.fromisoformat(req["expires_at"])
+                if req["expires_at"] is not None
+                else None
             )
             if self._outstanding.reserve(
                 str(req["nano_address"]),
@@ -471,10 +483,15 @@ class NanoRail:
             raise PaymentNotConfirmed(
                 "requirement lacks requirement_id, nano_address or amount_raw"
             )
+        # Only a missing or ``None`` expires_at means "no expiry". Any other
+        # value - including falsy ones such as ``""``, ``0`` or ``False`` - must
+        # be an ISO 8601 string, or the requirement is refused.
         expires_at = requirement.get("expires_at")
-        if expires_at:
+        if expires_at is not None:
+            if not isinstance(expires_at, str):
+                raise PaymentNotConfirmed("requirement has an unreadable expires_at")
             try:
-                deadline = datetime.fromisoformat(str(expires_at))
+                deadline = datetime.fromisoformat(expires_at)
             except ValueError as exc:
                 raise PaymentNotConfirmed(
                     "requirement has an unreadable expires_at"
@@ -568,7 +585,7 @@ def create_nano_payment_requirement(
     if expires_in_seconds is not None and expires_in_seconds <= 0:
         raise ValueError("expires_in_seconds must be positive")
     expires_at = None
-    if expires_in_seconds:
+    if expires_in_seconds is not None:
         expires_at = (
             datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
         ).isoformat()

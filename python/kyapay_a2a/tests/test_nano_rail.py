@@ -39,6 +39,16 @@ H2 = "2" * 64
 H3 = "ABC" + "0" * 61
 
 
+@pytest.fixture(autouse=True)
+def fresh_default_stores(monkeypatch):
+    """Give each test its own process-wide default stores, so tests that reuse
+    a block hash or amount do not see one another's claims."""
+    monkeypatch.setattr(nano, "_DEFAULT_CLAIMS", InMemoryClaims(), raising=False)
+    monkeypatch.setattr(
+        nano, "_DEFAULT_OUTSTANDING", InMemoryOutstandingAmounts(), raising=False
+    )
+
+
 def test_nano_quote_is_feeless_and_fast():
     """Nano should quote a zero fee and sub-second finality."""
     rail = NanoRail()
@@ -468,6 +478,28 @@ def test_pay_with_requirement_enforces_expiry_and_match():
     assert rail.pay(DEST, req["amount_raw"], H1, requirement=req).settled
 
 
+@pytest.mark.parametrize("falsy_expiry", ["", 0, 0.0, False, "   "])
+def test_falsy_expires_at_is_not_treated_as_no_expiry(falsy_expiry):
+    """Only a missing/``None`` expires_at means "no expiry"; any other falsy
+    value is unreadable and refused, never skipped."""
+    rail = NanoRail()
+    req = rail.requirement("1.00", "/r", DEST)
+    rail._rpc = ledger((H1, req["amount_raw"]))
+    with pytest.raises(PaymentNotConfirmed, match="expires_at"):
+        rail.settle(dict(req, expires_at=falsy_expiry), H1)
+    # The refusal must not consume the block.
+    assert rail.settle(req, H1).settled
+
+
+def test_epoch_expires_at_is_expired():
+    """An expires_at at the Unix epoch is long past and must be refused."""
+    rail = NanoRail()
+    req = rail.requirement("1.00", "/r", DEST)
+    rail._rpc = ledger((H1, req["amount_raw"]))
+    with pytest.raises(PaymentNotConfirmed, match="expired"):
+        rail.settle(dict(req, expires_at="1970-01-01T00:00:00+00:00"), H1)
+
+
 @pytest.mark.parametrize(
     "broken",
     [{"rail": "skyfire-usd"}, {"requirement_id": ""}, {"expires_at": "soon"}],
@@ -492,12 +524,13 @@ def test_rails_sharing_an_outstanding_store_never_share_an_amount(monkeypatch):
         worker_b.requirement("1.00", "/r", DEST)
 
 
-def test_separate_default_stores_do_not_coordinate(monkeypatch):
-    """The default store is per rail: this is why workers must share one."""
+def test_default_rails_in_one_process_never_share_an_amount(monkeypatch):
+    """Rails built without ``outstanding`` share the process-wide default, so
+    two of them cannot issue the same amount for one address."""
     monkeypatch.setattr(nano.secrets, "randbelow", lambda n: 7)
-    a = NanoRail().requirement("1.00", "/r", DEST)
-    b = NanoRail().requirement("1.00", "/r", DEST)
-    assert a["amount_raw"] == b["amount_raw"]
+    NanoRail().requirement("1.00", "/r", DEST)
+    with pytest.raises(ValueError):
+        NanoRail().requirement("1.00", "/r", DEST)
 
 
 def test_custom_outstanding_store_is_used():
@@ -568,9 +601,32 @@ def test_rails_sharing_stores_settle_a_requirement_once():
         worker_b.settle(req, H2)
 
 
-def test_separate_default_claim_stores_do_not_coordinate():
-    """The default claim store is per rail: this is why rails must share one."""
+def test_default_rails_in_one_process_refuse_a_replay():
+    """Rails built without ``claim`` share the process-wide default claim
+    store, so a block settled on one is refused as a replay on another."""
     a = NanoRail(rpc=lambda request: block_info())
     b = NanoRail(rpc=lambda request: block_info())
+    assert a.verify(H, destination=DEST, amount_raw=AMOUNT).settled
+    with pytest.raises(PaymentNotConfirmed, match="already used"):
+        b.verify(H, destination=DEST, amount_raw=AMOUNT)
+
+
+def test_default_rails_settle_a_requirement_once():
+    """A requirement settled on one default rail cannot be settled again on
+    another default rail in the same process, even with a fresh block."""
+    a, b = NanoRail(), NanoRail()
+    req = a.requirement("1.00", "/r", DEST, expires_in_seconds=60)
+    a._rpc = b._rpc = ledger((H1, req["amount_raw"]), (H2, req["amount_raw"]))
+    assert a.settle(req, H1).settled
+    with pytest.raises(PaymentNotConfirmed, match="already used"):
+        b.settle(req, H1)
+    with pytest.raises(PaymentNotConfirmed, match="already settled"):
+        b.settle(req, H2)
+
+
+def test_injected_claim_store_is_not_the_default():
+    """A rail given its own ``claim`` does not consult the process default."""
+    a = NanoRail(rpc=lambda request: block_info())
+    b = NanoRail(rpc=lambda request: block_info(), claim=InMemoryClaims())
     assert a.verify(H, destination=DEST, amount_raw=AMOUNT).settled
     assert b.verify(H, destination=DEST, amount_raw=AMOUNT).settled
